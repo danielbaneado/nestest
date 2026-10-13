@@ -1,0 +1,30 @@
+# Evita enviar archivos innecesarios al contexto de build.
+# El .env NO se copia a la imagen: compose lo inyecta en runtime vía env_file.
+node_modules
+npm-debug.log*
+
+# Build output
+dist
+coverage
+tsconfig.build.tsbuildinfo
+
+# VCS & IDE
+.git
+.gitignore
+.gitattributes
+.vscode
+.idea
+
+# Env files (se inyectan en runtime)
+.env
+.env.*
+!.env.example
+
+# Docs & Docker
+*.md
+docker-compose*.yml
+Dockerfile*
+
+# Misc
+.DS_Store
+*.log
