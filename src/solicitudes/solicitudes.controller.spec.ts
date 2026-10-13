@@ -5,6 +5,7 @@ import { SolicitudesController } from './solicitudes.controller.js';
 import { SolicitudesService } from './solicitudes.service.js';
 import { Solicitud } from './dao/solicitud.dao.js';
 import { EstadoSolicitud } from './estado-solicitud.enum.js';
+import { FiltrarSolicitudesDto, PaginatedResult } from './dto/filtrar-solicitudes.dto.js';
 import { ApiKeyGuard } from '../common/guards/api-key.guard.js';
 import { UserRoleGuard } from '../common/guards/user-role.guard.js';
 import { ConfigService } from '../config/config.service.js';
@@ -78,17 +79,21 @@ describe('SolicitudesController', () => {
   });
 
   describe('findAll', () => {
-    it('pasa el usuario al service', async () => {
-      await controller.findAll(asesor1);
-      expect(mockService.findAll).toHaveBeenCalledWith(asesor1);
+    it('pasa los filtros y el usuario al service', async () => {
+      const filtros: FiltrarSolicitudesDto = {};
+      await controller.findAll(filtros, asesor1);
+      expect(mockService.findAll).toHaveBeenCalledWith(asesor1, filtros);
     });
 
-    it('retorna la lista del service', async () => {
-      const list = [{ id: 1 }, { id: 2 }];
-      mockService.findAll.mockResolvedValue(list as any);
+    it('retorna el resultado paginado del service', async () => {
+      const paginatedResult: PaginatedResult<any> = {
+        items: [{ id: 1 }, { id: 2 }],
+        pagination: { page: 1, limit: 10, total: 2, totalPages: 1 },
+      };
+      mockService.findAll.mockResolvedValue(paginatedResult);
 
-      const result = await controller.findAll(admin);
-      expect(result).toBe(list);
+      const result = await controller.findAll({}, admin);
+      expect(result).toBe(paginatedResult);
     });
   });
 

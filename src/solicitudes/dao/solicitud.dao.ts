@@ -4,9 +4,11 @@ import {
   Column,
   CreateDateColumn,
   UpdateDateColumn,
+  OneToMany,
 } from 'typeorm';
 import { ApiProperty } from '@nestjs/swagger';
 import { EstadoSolicitud } from '../estado-solicitud.enum.js';
+import type { SolicitudHistorial } from './solicitud-historial.dao.js';
 
 @Entity()
 export class Solicitud {
@@ -41,4 +43,7 @@ export class Solicitud {
   @ApiProperty({ description: 'Fecha de última modificación' })
   @UpdateDateColumn()
   actualizadaEn: Date;
+
+  @OneToMany('SolicitudHistorial', 'solicitud', { cascade: true })
+  historial: SolicitudHistorial[];
 }

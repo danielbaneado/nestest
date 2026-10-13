@@ -1,10 +1,14 @@
 import { ForbiddenException, NotFoundException, ConflictException } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { getRepositoryToken } from '@nestjs/typeorm';
+import { DataSource } from 'typeorm';
 import { SolicitudesService, CurrentUser } from './solicitudes.service.js';
 import { Solicitud } from './dao/solicitud.dao.js';
+import { SolicitudHistorial } from './dao/solicitud-historial.dao.js';
 import { EstadoSolicitud } from './estado-solicitud.enum.js';
 import { CreateSolicitudDto } from './dto/create-solicitud.dto.js';
+import { FiltrarSolicitudesDto } from './dto/filtrar-solicitudes.dto.js';
+import { TipoEventoHistorial } from './dao/solicitud-historial.dao.js';
 
 const asesor1: CurrentUser = { username: 'asesor1', role: 'asesor' };
 const asesor2: CurrentUser = { username: 'asesor2', role: 'asesor' };
@@ -30,6 +34,15 @@ describe('SolicitudesService', () => {
     save: vi.fn(),
     find: vi.fn(),
     findOne: vi.fn(),
+    createQueryBuilder: vi.fn(),
+  };
+  const historialRepo = {
+    create: vi.fn(),
+    save: vi.fn(),
+    find: vi.fn(),
+  };
+  const dataSource = {
+    transaction: vi.fn(),
   };
 
   beforeEach(async () => {
@@ -38,11 +51,26 @@ describe('SolicitudesService', () => {
     repo.create.mockImplementation((data) => ({ ...data }));
     // save() devuelve la entidad persistida
     repo.save.mockImplementation(async (entity) => ({ id: 1, ...entity }));
+    historialRepo.create.mockImplementation((data) => ({ ...data }));
+    historialRepo.save.mockImplementation(async (entity) => ({ id: 1, ...entity }));
+    // dataSource.transaction ejecuta el callback con un manager que tiene los repositorios
+    dataSource.transaction.mockImplementation(async (callback) => {
+      const manager = {
+        getRepository: vi.fn((entity) => {
+          if (entity === Solicitud) return repo;
+          if (entity === SolicitudHistorial) return historialRepo;
+          return {};
+        }),
+      };
+      return callback(manager);
+    });
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
         SolicitudesService,
         { provide: getRepositoryToken(Solicitud), useValue: repo },
+        { provide: getRepositoryToken(SolicitudHistorial), useValue: historialRepo },
+        { provide: DataSource, useValue: dataSource },
       ],
     }).compile();
 
@@ -116,36 +144,205 @@ describe('SolicitudesService', () => {
     });
   });
 
-  // ---------------------------------------------------------------- RN-02
-  describe('findAll (RN-02)', () => {
-    it('el asesor filtra en la consulta a BD por su propio usuario', async () => {
-      const own = [build()];
-      repo.find.mockResolvedValue(own);
+  // ---------------------------------------------------------------- RN-02 / RN-08
+  describe('findAll (RN-02, RN-08)', () => {
+    const solicitudes = [
+      build({ id: 1, cliente: 'Cliente A', asesor: 'asesor1', estado: EstadoSolicitud.PENDIENTE, creadaEn: new Date('2026-10-01T10:00:00Z') }),
+      build({ id: 2, cliente: 'Cliente B', asesor: 'asesor1', estado: EstadoSolicitud.EN_GESTION, creadaEn: new Date('2026-10-02T10:00:00Z') }),
+      build({ id: 3, cliente: 'Cliente C', asesor: 'asesor2', estado: EstadoSolicitud.RESUELTA, creadaEn: new Date('2026-10-03T10:00:00Z') }),
+    ];
+
+    it('el asesor filtra en la consulta a BD por su propio usuario (sin filtros adicionales)', async () => {
+      const own = [solicitudes[0], solicitudes[1]];
+      const qb = {
+        andWhere: vi.fn().mockReturnThis(),
+        orderBy: vi.fn().mockReturnThis(),
+        skip: vi.fn().mockReturnThis(),
+        take: vi.fn().mockReturnThis(),
+        getCount: vi.fn().mockResolvedValue(own.length),
+        getMany: vi.fn().mockResolvedValue(own),
+      };
+      repo.createQueryBuilder.mockReturnValue(qb);
 
       const result = await service.findAll(asesor1);
 
-      expect(repo.find).toHaveBeenCalledTimes(1);
-      expect(repo.find).toHaveBeenCalledWith({ where: { asesor: 'asesor1' } });
-      expect(result).toBe(own);
+      expect(repo.createQueryBuilder).toHaveBeenCalledTimes(1);
+      expect(qb.andWhere).toHaveBeenCalledWith('solicitud.asesor = :username', { username: 'asesor1' });
+      expect(result.items).toBe(own);
+      expect(result.pagination).toEqual({ page: 1, limit: 10, total: 2, totalPages: 1 });
     });
 
-    it.each([
-      ['supervisor', supervisor],
-      ['admin', admin],
-    ])('el rol %s consulta todas las solicitudes sin filtro', async (_r, user) => {
-      const all = [build(), build({ id: 2, asesor: 'asesor2' })];
-      repo.find.mockResolvedValue(all);
+    it('el rol supervisor consulta todas las solicitudes sin filtro de asesor', async () => {
+      const qb = {
+        andWhere: vi.fn().mockReturnThis(),
+        orderBy: vi.fn().mockReturnThis(),
+        skip: vi.fn().mockReturnThis(),
+        take: vi.fn().mockReturnThis(),
+        getCount: vi.fn().mockResolvedValue(solicitudes.length),
+        getMany: vi.fn().mockResolvedValue(solicitudes),
+      };
+      repo.createQueryBuilder.mockReturnValue(qb);
 
-      const result = await service.findAll(user);
+      const result = await service.findAll(supervisor);
 
-      expect(repo.find).toHaveBeenCalledWith();
-      expect(result).toBe(all);
+      expect(qb.andWhere).not.toHaveBeenCalledWith('solicitud.asesor = :username', expect.anything());
+      expect(result.items.length).toBe(3);
+      expect(result.pagination.total).toBe(3);
     });
 
-    it('devuelve lista vacía si no hay solicitudes', async () => {
-      repo.find.mockResolvedValue([]);
+    it('aplica filtro por estado', async () => {
+      const filtered = [solicitudes[0]];
+      const qb = {
+        andWhere: vi.fn().mockReturnThis(),
+        orderBy: vi.fn().mockReturnThis(),
+        skip: vi.fn().mockReturnThis(),
+        take: vi.fn().mockReturnThis(),
+        getCount: vi.fn().mockResolvedValue(filtered.length),
+        getMany: vi.fn().mockResolvedValue(filtered),
+      };
+      repo.createQueryBuilder.mockReturnValue(qb);
 
-      await expect(service.findAll(asesor1)).resolves.toEqual([]);
+      const filtros: FiltrarSolicitudesDto = { estado: EstadoSolicitud.PENDIENTE };
+      const result = await service.findAll(admin, filtros);
+
+      expect(qb.andWhere).toHaveBeenCalledWith('solicitud.estado = :estado', { estado: EstadoSolicitud.PENDIENTE });
+      expect(result.items.length).toBe(1);
+    });
+
+    it('aplica filtro por asesor (solo admin/supervisor)', async () => {
+      const filtered = [solicitudes[0], solicitudes[1]];
+      const qb = {
+        andWhere: vi.fn().mockReturnThis(),
+        orderBy: vi.fn().mockReturnThis(),
+        skip: vi.fn().mockReturnThis(),
+        take: vi.fn().mockReturnThis(),
+        getCount: vi.fn().mockResolvedValue(filtered.length),
+        getMany: vi.fn().mockResolvedValue(filtered),
+      };
+      repo.createQueryBuilder.mockReturnValue(qb);
+
+      const filtros: FiltrarSolicitudesDto = { asesor: 'asesor1' };
+      const result = await service.findAll(admin, filtros);
+
+      expect(qb.andWhere).toHaveBeenCalledWith('solicitud.asesor = :asesor', { asesor: 'asesor1' });
+      expect(result.items.length).toBe(2);
+    });
+
+    it('el asesor NO puede usar el filtro asesor para ver solicitudes ajenas', async () => {
+      const own = [solicitudes[0], solicitudes[1]];
+      const qb = {
+        andWhere: vi.fn().mockReturnThis(),
+        orderBy: vi.fn().mockReturnThis(),
+        skip: vi.fn().mockReturnThis(),
+        take: vi.fn().mockReturnThis(),
+        getCount: vi.fn().mockResolvedValue(own.length),
+        getMany: vi.fn().mockResolvedValue(own),
+      };
+      repo.createQueryBuilder.mockReturnValue(qb);
+
+      const filtros: FiltrarSolicitudesDto = { asesor: 'asesor2' };
+      const result = await service.findAll(asesor1, filtros);
+
+      // Solo se debe llamar andWhere con el filtro de asesor del usuario autenticado
+      const asesorCalls = qb.andWhere.mock.calls.filter(call => call[0].includes('asesor'));
+      expect(asesorCalls.length).toBe(1);
+      expect(asesorCalls[0][0]).toBe('solicitud.asesor = :username');
+      expect(asesorCalls[0][1]).toEqual({ username: 'asesor1' });
+      expect(result.items.length).toBe(2);
+    });
+
+    it('aplica búsqueda parcial por cliente (ILIKE)', async () => {
+      const filtered = [solicitudes[0]];
+      const qb = {
+        andWhere: vi.fn().mockReturnThis(),
+        orderBy: vi.fn().mockReturnThis(),
+        skip: vi.fn().mockReturnThis(),
+        take: vi.fn().mockReturnThis(),
+        getCount: vi.fn().mockResolvedValue(filtered.length),
+        getMany: vi.fn().mockResolvedValue(filtered),
+      };
+      repo.createQueryBuilder.mockReturnValue(qb);
+
+      const filtros: FiltrarSolicitudesDto = { cliente: 'cliente a' };
+      const result = await service.findAll(admin, filtros);
+
+      expect(qb.andWhere).toHaveBeenCalledWith('solicitud.cliente ILIKE :cliente', { cliente: '%cliente a%' });
+      expect(result.items.length).toBe(1);
+    });
+
+    it('aplica filtro por rango de fechas (desde y hasta)', async () => {
+      const filtered = [solicitudes[0], solicitudes[1]];
+      const qb = {
+        andWhere: vi.fn().mockReturnThis(),
+        orderBy: vi.fn().mockReturnThis(),
+        skip: vi.fn().mockReturnThis(),
+        take: vi.fn().mockReturnThis(),
+        getCount: vi.fn().mockResolvedValue(filtered.length),
+        getMany: vi.fn().mockResolvedValue(filtered),
+      };
+      repo.createQueryBuilder.mockReturnValue(qb);
+
+      const filtros: FiltrarSolicitudesDto = {
+        desde: '2026-10-01T00:00:00Z',
+        hasta: '2026-10-02T23:59:59Z',
+      };
+      const result = await service.findAll(admin, filtros);
+
+      expect(qb.andWhere).toHaveBeenCalledWith('solicitud.creadaEn BETWEEN :desde AND :hasta', expect.any(Object));
+      expect(result.items.length).toBe(2);
+    });
+
+    it('aplica paginación con page y limit', async () => {
+      const all = solicitudes;
+      const qb = {
+        andWhere: vi.fn().mockReturnThis(),
+        orderBy: vi.fn().mockReturnThis(),
+        skip: vi.fn().mockReturnThis(),
+        take: vi.fn().mockReturnThis(),
+        getCount: vi.fn().mockResolvedValue(all.length),
+        getMany: vi.fn().mockResolvedValue([all[0]]),
+      };
+      repo.createQueryBuilder.mockReturnValue(qb);
+
+      const filtros: FiltrarSolicitudesDto = { page: 1, limit: 1 };
+      const result = await service.findAll(admin, filtros);
+
+      expect(qb.skip).toHaveBeenCalledWith(0);
+      expect(qb.take).toHaveBeenCalledWith(1);
+      expect(result.pagination).toEqual({ page: 1, limit: 1, total: 3, totalPages: 3 });
+    });
+
+    it('usa valores por defecto page=1 y limit=10 cuando no se envían', async () => {
+      const qb = {
+        andWhere: vi.fn().mockReturnThis(),
+        orderBy: vi.fn().mockReturnThis(),
+        skip: vi.fn().mockReturnThis(),
+        take: vi.fn().mockReturnThis(),
+        getCount: vi.fn().mockResolvedValue(0),
+        getMany: vi.fn().mockResolvedValue([]),
+      };
+      repo.createQueryBuilder.mockReturnValue(qb);
+
+      await service.findAll(admin);
+
+      expect(qb.skip).toHaveBeenCalledWith(0);
+      expect(qb.take).toHaveBeenCalledWith(10);
+    });
+
+    it('ordena por fecha de creación descendente', async () => {
+      const qb = {
+        andWhere: vi.fn().mockReturnThis(),
+        orderBy: vi.fn().mockReturnThis(),
+        skip: vi.fn().mockReturnThis(),
+        take: vi.fn().mockReturnThis(),
+        getCount: vi.fn().mockResolvedValue(0),
+        getMany: vi.fn().mockResolvedValue([]),
+      };
+      repo.createQueryBuilder.mockReturnValue(qb);
+
+      await service.findAll(admin);
+
+      expect(qb.orderBy).toHaveBeenCalledWith('solicitud.creadaEn', 'DESC');
     });
   });
 
@@ -486,6 +683,155 @@ describe('SolicitudesService', () => {
         const result = await service.asignar(1, asignarDto, supervisor);
 
         expect(result.asesor).toBe('asesor2');
+      });
+    });
+  });
+
+  // ---------------------------------------------------------------- RN-09
+  describe('create (RN-09: historial CREACION)', () => {
+    const dto: CreateSolicitudDto = {
+      cliente: 'Juan Pérez',
+      descripcion: 'Consulta de producto',
+    };
+
+    it('registra evento CREACION con valor inicial PENDIENTE en la transacción', async () => {
+      await service.create(dto, asesor1);
+
+      // Verificar que se guardó la solicitud
+      expect(repo.save).toHaveBeenCalledTimes(1);
+      const savedSolicitud = repo.save.mock.calls[0][0];
+      expect(savedSolicitud.estado).toBe(EstadoSolicitud.PENDIENTE);
+
+      // Verificar que se registró el historial
+      expect(historialRepo.save).toHaveBeenCalledTimes(1);
+      const historialEvent = historialRepo.save.mock.calls[0][0];
+      expect(historialEvent.tipoEvento).toBe(TipoEventoHistorial.CREACION);
+      expect(historialEvent.valorAnterior).toBeNull();
+      expect(historialEvent.valorNuevo).toBe(EstadoSolicitud.PENDIENTE);
+      expect(historialEvent.usuarioActor).toBe('asesor1');
+    });
+  });
+
+  describe('updateEstado (RN-09: historial ESTADO)', () => {
+    it('registra evento ESTADO con valorAnterior y valorNuevo en la transacción', async () => {
+      const solicitud = build({ id: 1, estado: EstadoSolicitud.PENDIENTE, asesor: 'asesor1' });
+      repo.findOne.mockResolvedValue(solicitud);
+
+      await service.updateEstado(1, { estado: EstadoSolicitud.EN_GESTION }, supervisor);
+
+      expect(repo.save).toHaveBeenCalledTimes(1);
+      expect(historialRepo.save).toHaveBeenCalledTimes(1);
+      const historialEvent = historialRepo.save.mock.calls[0][0];
+      expect(historialEvent.tipoEvento).toBe(TipoEventoHistorial.ESTADO);
+      expect(historialEvent.valorAnterior).toBe(EstadoSolicitud.PENDIENTE);
+      expect(historialEvent.valorNuevo).toBe(EstadoSolicitud.EN_GESTION);
+      expect(historialEvent.usuarioActor).toBe('supervisor1');
+    });
+  });
+
+  describe('asignar (RN-09: historial ASIGNACION)', () => {
+    const asignarDto = { asesorId: 'asesor2' };
+
+    it('registra evento ASIGNACION con valorAnterior y valorNuevo en la transacción', async () => {
+      const solicitud = build({ id: 1, estado: EstadoSolicitud.PENDIENTE, asesor: 'asesor1' });
+      repo.findOne.mockResolvedValue(solicitud);
+
+      await service.asignar(1, asignarDto, supervisor);
+
+      expect(repo.save).toHaveBeenCalledTimes(1);
+      expect(historialRepo.save).toHaveBeenCalledTimes(1);
+      const historialEvent = historialRepo.save.mock.calls[0][0];
+      expect(historialEvent.tipoEvento).toBe(TipoEventoHistorial.ASIGNACION);
+      expect(historialEvent.valorAnterior).toBe('asesor1');
+      expect(historialEvent.valorNuevo).toBe('asesor2');
+      expect(historialEvent.usuarioActor).toBe('supervisor1');
+    });
+
+    it('registra valorAnterior como "sin asignar" cuando la solicitud no tenía asesor', async () => {
+      const solicitud = build({ id: 1, estado: EstadoSolicitud.PENDIENTE, asesor: null });
+      repo.findOne.mockResolvedValue(solicitud);
+
+      await service.asignar(1, asignarDto, supervisor);
+
+      const historialEvent = historialRepo.save.mock.calls[0][0];
+      expect(historialEvent.valorAnterior).toBe('sin asignar');
+      expect(historialEvent.valorNuevo).toBe('asesor2');
+    });
+  });
+
+  describe('getHistorial (RN-09)', () => {
+    it('lanza NotFoundException si la solicitud no existe', async () => {
+      repo.findOne.mockResolvedValue(null);
+
+      await expect(service.getHistorial(99, admin)).rejects.toBeInstanceOf(NotFoundException);
+    });
+
+    it('un asesor NO puede ver el historial de una solicitud ajena', async () => {
+      repo.findOne.mockResolvedValue(build({ asesor: 'asesor1' }));
+
+      await expect(service.getHistorial(1, asesor2)).rejects.toBeInstanceOf(ForbiddenException);
+    });
+
+    it('un asesor SÍ puede ver el historial de su propia solicitud', async () => {
+      const solicitud = build({ id: 1, asesor: 'asesor1' });
+      repo.findOne.mockResolvedValue(solicitud);
+
+      const historial = [
+        { id: 1, solicitudId: 1, tipoEvento: TipoEventoHistorial.CREACION, valorAnterior: null, valorNuevo: 'PENDIENTE', usuarioActor: 'asesor1', fechaEvento: new Date() },
+        { id: 2, solicitudId: 1, tipoEvento: TipoEventoHistorial.ESTADO, valorAnterior: 'PENDIENTE', valorNuevo: 'EN_GESTION', usuarioActor: 'asesor1', fechaEvento: new Date() },
+      ];
+      historialRepo.find.mockResolvedValue(historial);
+
+      const result = await service.getHistorial(1, asesor1);
+
+      expect(result).toHaveLength(2);
+      expect(result[0].tipoEvento).toBe(TipoEventoHistorial.CREACION);
+      expect(result[1].tipoEvento).toBe(TipoEventoHistorial.ESTADO);
+    });
+
+    it('admin puede ver el historial de cualquier solicitud', async () => {
+      const solicitud = build({ id: 1, asesor: 'asesor2' });
+      repo.findOne.mockResolvedValue(solicitud);
+
+      const historial = [
+        { id: 1, solicitudId: 1, tipoEvento: TipoEventoHistorial.CREACION, valorAnterior: null, valorNuevo: 'PENDIENTE', usuarioActor: 'supervisor1', fechaEvento: new Date() },
+      ];
+      historialRepo.find.mockResolvedValue(historial);
+
+      const result = await service.getHistorial(1, admin);
+
+      expect(result).toHaveLength(1);
+    });
+
+    it('supervisor puede ver el historial de cualquier solicitud', async () => {
+      const solicitud = build({ id: 1, asesor: 'asesor2' });
+      repo.findOne.mockResolvedValue(solicitud);
+
+      const historial = [
+        { id: 1, solicitudId: 1, tipoEvento: TipoEventoHistorial.CREACION, valorAnterior: null, valorNuevo: 'PENDIENTE', usuarioActor: 'supervisor1', fechaEvento: new Date() },
+      ];
+      historialRepo.find.mockResolvedValue(historial);
+
+      const result = await service.getHistorial(1, supervisor);
+
+      expect(result).toHaveLength(1);
+    });
+
+    it('ordena el historial por fechaEvento ASC', async () => {
+      const solicitud = build({ id: 1, asesor: 'asesor1' });
+      repo.findOne.mockResolvedValue(solicitud);
+
+      const historial = [
+        { id: 1, solicitudId: 1, tipoEvento: TipoEventoHistorial.CREACION, valorAnterior: null, valorNuevo: 'PENDIENTE', usuarioActor: 'asesor1', fechaEvento: new Date('2026-10-01T10:00:00Z') },
+        { id: 2, solicitudId: 1, tipoEvento: TipoEventoHistorial.ESTADO, valorAnterior: 'PENDIENTE', valorNuevo: 'EN_GESTION', usuarioActor: 'asesor1', fechaEvento: new Date('2026-10-01T11:00:00Z') },
+      ];
+      historialRepo.find.mockResolvedValue(historial);
+
+      await service.getHistorial(1, asesor1);
+
+      expect(historialRepo.find).toHaveBeenCalledWith({
+        where: { solicitudId: 1 },
+        order: { fechaEvento: 'ASC' },
       });
     });
   });
